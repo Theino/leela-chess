@@ -38,6 +38,7 @@
 struct StateInfo {
 
   // Copied when making a move
+  Key    materialKey;
   int    castlingRights;
   int    rule50;
   int    pliesFromNull;
@@ -145,6 +146,7 @@ public:
 
   // Accessing hash keys
   Key key() const;
+  Key full_key() const;
   Key key_after(Move m) const;
   Key material_key() const;
   Key pawn_key() const;
@@ -153,7 +155,8 @@ public:
   Color side_to_move() const;
   int game_ply() const;
   bool is_draw() const;
-	int repetitions_count() const;
+  int repetitions_count() const;
+  bool has_repeated() const;
   int rule50_count() const;
 
   // Position consistency check, for debugging
@@ -172,6 +175,7 @@ private:
   void move_piece(Piece pc, Square from, Square to);
   template<bool Do>
   void do_castling(Color us, Square from, Square& to, Square& rfrom, Square& rto);
+  bool is_draw_by_insufficient_material() const;
 
   // Data members
   Piece board[SQUARE_NB];
@@ -265,6 +269,10 @@ inline bool Position::castling_impeded(CastlingRight cr) const {
 
 inline Square Position::castling_rook_square(CastlingRight cr) const {
   return castlingRookSquare[cr];
+}
+
+inline Key Position::material_key() const {
+    return st->materialKey;    
 }
 
 template<PieceType Pt>
@@ -407,6 +415,7 @@ struct BoardHistory {
   void set(const std::string& fen);
   BoardHistory shallow_clone() const;
   void do_move(Move m);
+  bool undo_move();
   std::string pgn() const;
 };
 

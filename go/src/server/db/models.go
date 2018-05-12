@@ -20,7 +20,9 @@ type TrainingRun struct {
 	BestNetworkID uint
 	Matches       []Match
 
-	Name string
+	Description     string
+	TrainParameters string
+	Active          bool
 }
 
 type Network struct {
@@ -34,17 +36,23 @@ type Network struct {
 
 	Layers  int
 	Filters int
+
+	// Cached here, as expensive to do COUNT(*) on Postgresql
+	GamesPlayed int
 }
 
 type Match struct {
 	gorm.Model
 
 	TrainingRunID uint
+	Parameters    string
 
 	Candidate     Network
 	CandidateID   uint
 	CurrentBest   Network
 	CurrentBestID uint
+
+	GamesCreated int
 
 	Wins   int
 	Losses int
@@ -52,6 +60,10 @@ type Match struct {
 
 	GameCap int
 	Done    bool
+	Passed  bool
+
+	// If true, this is not a promotion match
+	TestOnly bool
 }
 
 type MatchGame struct {
@@ -65,21 +77,33 @@ type MatchGame struct {
 
 	Version uint
 	Pgn     string
+	Result  int
+	Done    bool
+	Flip    bool
+
+	EngineVersion string
 }
 
 type TrainingGame struct {
-	ID        uint64 `gorm:"primary_key"`
-	CreatedAt time.Time
+	ID        uint64    `gorm:"primary_key"`
+	CreatedAt time.Time `gorm:"index"`
 
 	User          User
-	UserID        uint
+	UserID        uint `gorm:"index"`
 	TrainingRun   TrainingRun
 	TrainingRunID uint
 	Network       Network
-	NetworkID     uint
+	NetworkID     uint `gorm:"index"`
 
 	Version   uint
 	Path      string
-	Pgn       string
 	Compacted bool
+
+	EngineVersion string
+}
+
+type ServerData struct {
+	gorm.Model
+
+	TrainingPgnUploaded int
 }

@@ -17,6 +17,9 @@
 */
 
 #include "config.h"
+#include "Network.h"
+#include "UCI.h"
+
 #include <algorithm>
 #include <cassert>
 #include <stack>
@@ -31,8 +34,9 @@
 #include <thread>
 #include <boost/utility.hpp>
 #include <boost/format.hpp>
+#include <boost/spirit/home/x3.hpp>
+#include "zlib.h"
 
-#include "Im2Col.h"
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
 #endif
@@ -43,28 +47,31 @@
 #include <cblas.h>
 #endif
 #ifdef USE_OPENCL
-#include "OpenCL.h"
+#include "OpenCLScheduler.h"
 #include "UCTNode.h"
 #endif
 
-#include "Utils.h"
 #include "Random.h"
 #include "Network.h"
+#include "NNCache.h"
 #include "Utils.h"
 #include "Parameters.h"
 #include "Timing.h"
 #include "Movegen.h"
+#include "ThreadPool.h"
+#include "Im2Col.h"
 
+namespace x3 = boost::spirit::x3;
 using namespace Utils;
 
-constexpr int Network::FORMAT_VERSION;
+// Seems this is required for the Darwin compiler.
+// Not sure why only T_HISTORY and not all the others.
 constexpr int Network::T_HISTORY;
-constexpr int Network::INPUT_CHANNELS;
 
-constexpr int Network::NUM_OUTPUT_POLICY;
-constexpr int Network::NUM_VALUE_CHANNELS;
-
-std::unordered_map<Move, int, std::hash<int>> Network::move_lookup;
+bool Network::initialized = false;
+size_t Network::m_format_version{0};
+std::unordered_map<Move, int, std::hash<int>> Network::old_move_lookup;
+std::unordered_map<Move, int, std::hash<int>> Network::new_move_lookup;
 
 // Input + residual block tower
 static std::vector<std::vector<float>> conv_weights;
@@ -78,8 +85,14 @@ static std::vector<float> conv_pol_b;
 static std::array<float, Network::NUM_POLICY_INPUT_PLANES> bn_pol_w1;
 static std::array<float, Network::NUM_POLICY_INPUT_PLANES> bn_pol_w2;
 
-static std::array<float, Network::NUM_OUTPUT_POLICY*8*8*Network::NUM_POLICY_INPUT_PLANES> ip_pol_w;
-static std::array<float, Network::NUM_OUTPUT_POLICY> ip_pol_b;
+// TODO: These are compile time sized,
+// It would be nicer to dynamically size.
+// Just a little memory optimization.
+// But maybe there is a reason they must be array not vector?
+static std::array<float, Network::V1_NUM_OUTPUT_POLICY*8*8*Network::NUM_POLICY_INPUT_PLANES> v1_ip_pol_w;
+static std::array<float, Network::V1_NUM_OUTPUT_POLICY> v1_ip_pol_b;
+static std::array<float, Network::V2_NUM_OUTPUT_POLICY*8*8*Network::NUM_POLICY_INPUT_PLANES> v2_ip_pol_w;
+static std::array<float, Network::V2_NUM_OUTPUT_POLICY> v2_ip_pol_b;
 
 // Value head
 static std::vector<float> conv_val_w;
@@ -93,10 +106,24 @@ static std::array<float, Network::NUM_VALUE_CHANNELS> ip1_val_b;
 static std::array<float, Network::NUM_VALUE_CHANNELS> ip2_val_w;
 static std::array<float, 1> ip2_val_b;
 
-//void Network::benchmark(Position* pos, int iterations) //--temporarily (?) killed.
+size_t Network::get_format_version() {
+    return m_format_version;
+}
+
+size_t Network::get_input_channels() {
+    return m_format_version == 1 ? V1_INPUT_CHANNELS : V2_INPUT_CHANNELS;
+}
+
+size_t Network::get_hist_planes() {
+    return m_format_version == 1 ? V1_HIST_PLANES : V2_HIST_PLANES;
+}
+
+size_t Network::get_num_output_policy() {
+    return m_format_version == 1 ? V1_NUM_OUTPUT_POLICY : V2_NUM_OUTPUT_POLICY;
+}
 
 void Network::process_bn_var(std::vector<float>& weights, const float epsilon) {
-    for (auto&& w : weights) {
+    for(auto&& w : weights) {
         w = 1.0f / std::sqrt(w + epsilon);
     }
 }
@@ -173,36 +200,36 @@ std::vector<float> Network::zeropad_U(const std::vector<float>& U,
 
 extern "C" void openblas_set_num_threads(int num_threads);
 
-void Network::init() {
-    init_move_map();
-
+std::pair<int, int> Network::load_network(std::istream& wtfile) {
+    // Read format version
+    auto line = std::string{};
+    if (std::getline(wtfile, line)) {
+        auto iss = std::stringstream{ line };
+        // First line is the file format version id
+        iss >> m_format_version;
+        if (iss.fail()
+            || m_format_version > MAX_FORMAT_VERSION
+            || m_format_version < 1) {
+            myprintf("Weights file is the wrong version.\n");
+            return {0, 0};
+        } else {
+            assert(m_format_version <= MAX_FORMAT_VERSION);
+        }
+    } else {
+        myprintf("Weights file is empty.\n");
+        return {0, 0};
+    }
     // Count size of the network
     myprintf("Detecting residual layers...");
-    std::ifstream wtfile(cfg_weightsfile);
-    printf("Loading %s\n", cfg_weightsfile.c_str());
-    if (wtfile.fail()) {
-        myprintf("Could not open weights file: %s\n", cfg_weightsfile.c_str());
-        exit(EXIT_FAILURE);
-    }
-    std::string line;
-    auto linecount = size_t{0};
-    auto format_version = -1;
+    myprintf("v%d...", m_format_version);
+    // First line was the version number
+    auto linecount = size_t{1};
     auto channels = 0;
     while (std::getline(wtfile, line)) {
-        std::stringstream iss(line);
-        // First line is the file format version id
-        if (linecount == 0) {
-           iss >> format_version;
-           if (iss.fail() || format_version != FORMAT_VERSION) {
-               myprintf("Weights file is the wrong version.\n");
-               exit(EXIT_FAILURE);
-           } else {
-               myprintf("v%d...", format_version);
-           }
-        }
+        auto iss = std::stringstream{line};
         // Third line of parameters are the convolution layer biases,
         // so this tells us the amount of channels in the residual layers.
-        // (Provided they're all equally large - that's not actually required!)
+        // We are assuming all layers have the same amount of filters.
         if (linecount == 2) {
             auto count = std::distance(std::istream_iterator<std::string>(iss),
                                        std::istream_iterator<std::string>());
@@ -213,10 +240,14 @@ void Network::init() {
     }
     // 1 format id, 1 input layer (4 x weights), 14 ending weights,
     // the rest are residuals, every residual has 8 x weight lines
+    // Note: 14 ending weights is for value/policy head.
+    //     It's a coincidence it's the same number of input features
+    //     for V1 networks.
     auto residual_blocks = linecount - (1 + 4 + 14);
     if (residual_blocks % 8 != 0) {
         myprintf("\nInconsistent number of weights in the file.\n");
-        exit(EXIT_FAILURE);
+        myprintf("%d %d %d %d\n", m_format_version, residual_blocks, linecount, get_hist_planes());
+        return {0, 0};
     }
     residual_blocks /= 8;
     myprintf("%d blocks.\n", residual_blocks);
@@ -233,10 +264,13 @@ void Network::init() {
     linecount = 0;
     while (std::getline(wtfile, line)) {
         std::vector<float> weights;
-        float weight;
-        std::istringstream iss(line);
-        while (iss >> weight) {
-            weights.emplace_back(weight);
+        auto it_line = cbegin(line);
+        const auto ok = phrase_parse(it_line, cend(line),
+                                     *x3::float_, x3::space, weights);
+        if (!ok || it_line != cend(line)) {
+            myprintf("\nFailed to parse weight file. Error on line %d.\n",
+                    linecount + 2); //+1 from version line, +1 from 0-indexing
+            return {0, 0};
         }
         if (linecount < plain_conv_wts) {
             if (linecount % 4 == 0) {
@@ -261,9 +295,17 @@ void Network::init() {
             process_bn_var(weights);
             std::copy(begin(weights), end(weights), begin(bn_pol_w2));
         } else if (linecount == plain_conv_wts + 4) {
-            std::copy(begin(weights), end(weights), begin(ip_pol_w));
+            if (m_format_version == 1) {
+                std::copy(begin(weights), end(weights), begin(v1_ip_pol_w));
+            } else {
+                std::copy(begin(weights), end(weights), begin(v2_ip_pol_w));
+            }
         } else if (linecount == plain_conv_wts + 5) {
-            std::copy(begin(weights), end(weights), begin(ip_pol_b));
+            if (m_format_version == 1) {
+                std::copy(begin(weights), end(weights), begin(v1_ip_pol_b));
+            } else {
+                std::copy(begin(weights), end(weights), begin(v2_ip_pol_b));
+            }
         } else if (linecount == plain_conv_wts + 6) {
             conv_val_w = std::move(weights);
         } else if (linecount == plain_conv_wts + 7) {
@@ -284,77 +326,179 @@ void Network::init() {
         }
         linecount++;
     }
-    wtfile.close();
+
+    return {channels, residual_blocks};
+}
+
+std::pair<int, int> Network::load_network_file(std::string filename) {
+    // gzopen supports both gz and non-gz files, will decompress or just read directly as needed.
+    auto gzhandle = gzopen(filename.c_str(), "rb");
+    if (gzhandle == nullptr) {
+        myprintf("Could not open weights file: %s\n", filename.c_str());
+        return {0, 0};
+    }
+    // Stream the gz file in to a memory buffer stream.
+    std::stringstream buffer;
+    const int chunkBufferSize = 64 * 1024;
+    std::vector<char> chunkBuffer(chunkBufferSize);
+    while (true) {
+        int bytesRead = gzread(gzhandle, chunkBuffer.data(), chunkBufferSize);
+        if (bytesRead == 0) break;
+        if (bytesRead < 0) {
+            myprintf("Failed to decompress or read: %s\n", filename.c_str());
+            gzclose(gzhandle);
+            return {0, 0};
+        }
+        assert(bytesRead <= chunkBufferSize);
+        buffer.write(chunkBuffer.data(), bytesRead);
+    }
+    auto result = load_network(buffer);
+    gzclose(gzhandle);
+    return result;
+}
+
+void Network::initialize(void) {
+    if (initialized) return;
+    initialized = true;
+
+    init_move_map();
+
+    // Load network from file
+    size_t channels, residual_blocks;
+    assert(m_format_version == 0);
+    std::tie(channels, residual_blocks) = load_network_file(cfg_weightsfile);
+    assert(m_format_version > 0);
+    if (channels == 0) {
+        exit(EXIT_FAILURE);
+    }
 
     auto weight_index = size_t{0};
-
     // Input convolution
     // Winograd transform convolution weights
     conv_weights[weight_index] =
         winograd_transform_f(conv_weights[weight_index],
-                             channels, INPUT_CHANNELS);
+                             channels, get_input_channels());
     weight_index++;
 
     // Residual block convolutions
     for (auto i = size_t{0}; i < residual_blocks * 2; i++) {
-        conv_weights[weight_index] =
+		conv_weights[weight_index] =
             winograd_transform_f(conv_weights[weight_index],
                                  channels, channels);
         weight_index++;
     }
 
+    // Biases are not calculated and are typically zero but some networks might
+    // still have non-zero biases.
+    // Move biases to batchnorm means to make the output match without having
+    // to separately add the biases.
+    for (auto i = size_t{0}; i < conv_biases.size(); i++) {
+        for (auto j = size_t{0}; j < batchnorm_means[i].size(); j++) {
+            batchnorm_means[i][j] -= conv_biases[i][j];
+            conv_biases[i][j] = 0.0f;
+        }
+    }
+
+    if ((bn_val_w1.size() != conv_val_b.size()) ||
+        (bn_pol_w1.size() != conv_pol_b.size()) ) {
+            throw std::runtime_error("Weights are malformed. Incorrect number "
+             "of policy/value output planes.");
+    }
+
+    for (auto i = size_t{0}; i < bn_val_w1.size(); i++) {
+        bn_val_w1[i] -= conv_val_b[i];
+        conv_val_b[i] = 0.0f;
+    }
+
+    for (auto i = size_t{0}; i < bn_pol_w1.size(); i++) {
+        bn_pol_w1[i] -= conv_pol_b[i];
+        conv_pol_b[i] = 0.0f;
+    }
+
 #ifdef USE_OPENCL
-    myprintf("Initializing OpenCL\n");
+    myprintf("Initializing OpenCL.\n");
     opencl.initialize(channels);
 
-    auto tuners = opencl.get_sgemm_tuners();
-    if (cfg_tune_only) {
-        exit(EXIT_SUCCESS);
+    for(auto & opencl_net : opencl.get_networks()) {
+        auto tuners = opencl_net->getOpenCL().get_sgemm_tuners();
+
+        auto mwg = tuners[0];
+        auto kwg = tuners[2];
+        auto vwm = tuners[3];
+
+        weight_index = 0;
+
+        size_t m_ceil = ceilMultiple(ceilMultiple(channels, mwg), vwm);
+        size_t k_ceil = ceilMultiple(ceilMultiple(get_input_channels(), kwg), vwm);
+
+        auto Upad = zeropad_U(conv_weights[weight_index],
+                              channels, get_input_channels(),
+                              m_ceil, k_ceil);
+
+        // Winograd filter transformation changes filter size to 4x4
+        opencl_net->push_input_convolution(WINOGRAD_ALPHA, get_input_channels(), channels,
+                Upad, batchnorm_means[weight_index], batchnorm_stddivs[weight_index]);
+        weight_index++;
+
+        // residual blocks
+        for (auto i = size_t{0}; i < residual_blocks; i++) {
+            auto Upad1 = zeropad_U(conv_weights[weight_index],
+                                   channels, channels,
+                                   m_ceil, m_ceil);
+            auto Upad2 = zeropad_U(conv_weights[weight_index + 1],
+                                   channels, channels,
+                                   m_ceil, m_ceil);
+            opencl_net->push_residual(WINOGRAD_ALPHA, channels, channels,
+                                      Upad1,
+                                      batchnorm_means[weight_index],
+                                      batchnorm_stddivs[weight_index],
+                                      Upad2,
+                                      batchnorm_means[weight_index + 1],
+                                      batchnorm_stddivs[weight_index + 1]);
+            weight_index += 2;
+        }
+
+        // Output head convolutions
+        std::vector<float> bn_pol_means(bn_pol_w1.begin(), bn_pol_w1.end());
+        std::vector<float> bn_pol_stddivs(bn_pol_w2.begin(), bn_pol_w2.end());
+
+        std::vector<float> bn_val_means(bn_val_w1.begin(), bn_val_w1.end());
+        std::vector<float> bn_val_stddivs(bn_val_w2.begin(), bn_val_w2.end());
+
+        std::vector<float> ip_pol_w_vec;
+        std::vector<float> ip_pol_b_vec;
+        if (m_format_version == 1) {
+            ip_pol_w_vec = std::vector<float>(v1_ip_pol_w.begin(), v1_ip_pol_w.end());
+            ip_pol_b_vec = std::vector<float>(v1_ip_pol_b.begin(), v1_ip_pol_b.end());
+        } else {
+            ip_pol_w_vec = std::vector<float>(v2_ip_pol_w.begin(), v2_ip_pol_w.end());
+            ip_pol_b_vec = std::vector<float>(v2_ip_pol_b.begin(), v2_ip_pol_b.end());
+        }
+
+        std::vector<float> ip_val_w_vec(ip1_val_w.begin(), ip1_val_w.end());
+        std::vector<float> ip_val_b_vec(ip1_val_b.begin(), ip1_val_b.end());
+
+        constexpr unsigned int width = 8;
+        constexpr unsigned int height = 8;
+
+        opencl_net->push_policy(channels, NUM_POLICY_INPUT_PLANES,
+                NUM_POLICY_INPUT_PLANES*width*height, get_num_output_policy(),
+                conv_pol_w,
+                bn_pol_means, bn_pol_stddivs,
+                ip_pol_w_vec, ip_pol_b_vec);
+
+        opencl_net->push_value(channels, NUM_VALUE_INPUT_PLANES,
+                NUM_VALUE_INPUT_PLANES*width*height, NUM_VALUE_CHANNELS,
+                conv_val_w,
+                bn_val_means, bn_val_stddivs,
+                ip_val_w_vec, ip_val_b_vec);
     }
-    auto mwg = tuners[0];
-    auto kwg = tuners[2];
-    auto vwm = tuners[3];
-
-    weight_index = 0;
-
-    size_t m_ceil = lcm(lcm(channels, mwg), vwm);
-    size_t k_ceil = lcm(lcm(INPUT_CHANNELS, kwg), vwm);
-
-    auto Upad = zeropad_U(conv_weights[weight_index],
-                          channels, INPUT_CHANNELS,
-                          m_ceil, k_ceil);
-
-    // Winograd filter transformation changes filter size to 4x4
-    opencl_net.push_convolve(WINOGRAD_ALPHA, INPUT_CHANNELS, channels, Upad);
-    opencl_net.push_batchnorm(64, batchnorm_means[weight_index],
-                                  batchnorm_stddivs[weight_index]);
-    weight_index++;
-
-    // residual blocks
-    for (auto i = size_t{0}; i < residual_blocks; i++) {
-        auto Upad1 = zeropad_U(conv_weights[weight_index],
-                               channels, channels,
-                               m_ceil, m_ceil);
-        auto Upad2 = zeropad_U(conv_weights[weight_index + 1],
-                               channels, channels,
-                               m_ceil, m_ceil);
-        opencl_net.push_residual(WINOGRAD_ALPHA, channels, channels,
-                                 Upad1,
-                                 batchnorm_means[weight_index],
-                                 batchnorm_stddivs[weight_index],
-                                 Upad2,
-                                 batchnorm_means[weight_index + 1],
-                                 batchnorm_stddivs[weight_index + 1]);
-        weight_index += 2;
-    }
-    myprintf("done\n");
 #endif
 #ifdef USE_BLAS
 #ifndef __APPLE__
 #ifdef USE_OPENBLAS
-    // TODO(gary): Figure out a way to do this in a backwards compat way
     openblas_set_num_threads(1);
-    // myprintf("BLAS Core: %s\n", openblas_get_corename());
+    myprintf("BLAS Core: %s\n", openblas_get_corename());
 #endif
 #ifdef USE_MKL
     //mkl_set_threading_layer(MKL_THREADING_SEQUENTIAL);
@@ -368,12 +512,16 @@ void Network::init() {
 }
 
 void Network::init_move_map() {
-  std::vector<Move> moves;
+  // old includes black promotions from 2nd to 1st rank
+  // new excludes those
+  std::vector<Move> old_moves;
+  std::vector<Move> new_moves;
   for (Square s = SQ_A1; s <= SQ_H8; ++s) {
     // Queen and knight moves
     Bitboard b = attacks_bb(QUEEN, s, 0) | attacks_bb(KNIGHT, s, 0);
     while (b) {
-      moves.push_back(make_move(s, pop_lsb(&b)));
+      old_moves.push_back(make_move(s, pop_lsb(&b)));
+      new_moves.push_back(old_moves.back());
     }
   }
 
@@ -386,25 +534,53 @@ void Network::init_move_map() {
         }
         Square from = make_square(File(c_from), c == WHITE? RANK_7 : RANK_2);
         Square to = make_square(File(c_to), c == WHITE ? RANK_8 : RANK_1);
-        moves.push_back(make<PROMOTION>(from, to, QUEEN));
-        moves.push_back(make<PROMOTION>(from, to, ROOK));
-        moves.push_back(make<PROMOTION>(from, to, BISHOP));
+        // push both black and white promotions for old
+        old_moves.push_back(make<PROMOTION>(from, to, QUEEN));
+        old_moves.push_back(make<PROMOTION>(from, to, ROOK));
+        old_moves.push_back(make<PROMOTION>(from, to, BISHOP));
         // Don't need knight, as it's equivalent to pawn push to final rank.
+        if (c == WHITE) {
+          // only push white promotions (7th to 8th rank) for new
+          new_moves.push_back(make<PROMOTION>(from, to, QUEEN));
+          new_moves.push_back(make<PROMOTION>(from, to, ROOK));
+          new_moves.push_back(make<PROMOTION>(from, to, BISHOP));
+        }
       }
     }
   }
 
-  for (size_t i = 0; i < moves.size(); ++i) {
-    move_lookup[moves[i]] = i;
+  for (size_t i = 0; i < old_moves.size(); ++i) {
+    old_move_lookup[old_moves[i]] = i;
   }
-  myprintf("Generated %lu moves\n", moves.size());
+  for (size_t i = 0; i < new_moves.size(); ++i) {
+    new_move_lookup[new_moves[i]] = i;
+  }
 }
 
-int Network::lookup(Move move) {
+int Network::lookup(Move move, Color c) {
     if (type_of(move) != PROMOTION || promotion_type(move) == KNIGHT) {
+        // Mask off the special move flags,
+        // in particular en passant and castling
         move = Move(move & 0xfff);
     }
-    return move_lookup.at(move);
+    if (m_format_version == 1) {
+        return old_move_lookup.at(move);
+    } else {
+        if (c == WHITE) {
+            return new_move_lookup.at(move);
+        } else {
+            Move flipped_move;
+            if (type_of(move) == PROMOTION) {
+                flipped_move = make<PROMOTION>(~from_sq(move), ~to_sq(move), promotion_type(move));
+            } else {
+                flipped_move = make_move(~from_sq(move), ~to_sq(move));
+            }
+            // The NN plays BLACK with the board flipped vertically,
+            // And outputs the moves as if BLACK is moving up.
+            // Flip the policy so the moves are normal.
+            return new_move_lookup.at(flipped_move);
+        }
+    }
 }
 
 #ifdef USE_BLAS
@@ -498,7 +674,7 @@ void Network::winograd_sgemm(const std::vector<float>& U,
                              std::vector<float>& V,
                              std::vector<float>& M,
                              const int C, const int K) {
-    constexpr auto P = 8 * 8 / 4;
+    constexpr auto P = 8 * 8 / WINOGRAD_ALPHA;
 
     for (auto b = 0; b < WINOGRAD_TILE; b++) {
         auto offset_u = b * K * C;
@@ -701,23 +877,27 @@ void batchnorm(size_t channels,
 }
 
 void Network::forward_cpu(std::vector<float>& input,
-                          std::vector<float>& output) {
+                          std::vector<float>& output_pol,
+                          std::vector<float>& output_val) {
     // Input convolution
     constexpr int width = 8;
     constexpr int height = 8;
     constexpr int tiles = width * height / 4;
     // Calculate output channels
     const auto output_channels = conv_biases[0].size();
-    // Assumes that residual blocks are identical and have same
-    // number of inputs and outputs
-    const auto input_channels = output_channels;
+    //input_channels is the maximum number of input channels of any convolution.
+    //Residual blocks are identical, but the first convolution might be bigger
+    //when the network has very few filters
+    const auto input_channels = std::max(
+            static_cast<size_t>(output_channels),
+            static_cast<size_t>(get_input_channels()));
     auto conv_out = std::vector<float>(output_channels * width * height);
 
-    // TODO(gary): This *2 is wrong, but I'm not sure how...  And it makes the
-    // winograd cpu path match the GPU path and the non-winograd implementation
-    // as well.
-    auto V = std::vector<float>(WINOGRAD_TILE * input_channels * tiles * 2);
-    auto M = std::vector<float>(WINOGRAD_TILE * output_channels * tiles * 2);
+    auto V = std::vector<float>(WINOGRAD_TILE * input_channels * tiles);
+    auto M = std::vector<float>(WINOGRAD_TILE * output_channels * tiles);
+
+    std::vector<float> policy_data(Network::NUM_POLICY_INPUT_PLANES * width * height);
+    std::vector<float> value_data(Network::NUM_VALUE_INPUT_PLANES * width * height);
 
     winograd_convolve3(output_channels, input, conv_weights[0], V, M, conv_out);
     batchnorm<64>(output_channels, conv_out,
@@ -746,7 +926,18 @@ void Network::forward_cpu(std::vector<float>& input,
                       batchnorm_stddivs[i + 1].data(),
                       res.data());
     }
-    std::copy(begin(conv_out), end(conv_out), begin(output));
+    convolve<1>(NUM_POLICY_INPUT_PLANES, conv_out, conv_pol_w, conv_pol_b, policy_data);
+    convolve<1>(NUM_VALUE_INPUT_PLANES, conv_out, conv_val_w, conv_val_b, value_data);
+    batchnorm<width*height>(NUM_POLICY_INPUT_PLANES, policy_data, bn_pol_w1.data(), bn_pol_w2.data());
+
+    batchnorm<width*height>(NUM_VALUE_INPUT_PLANES, value_data, bn_val_w1.data(), bn_val_w2.data());
+
+    if (m_format_version == 1) {
+        innerproduct<NUM_POLICY_INPUT_PLANES*width*height, V1_NUM_OUTPUT_POLICY>(policy_data, v1_ip_pol_w, v1_ip_pol_b, output_pol);
+    } else {
+        innerproduct<NUM_POLICY_INPUT_PLANES*width*height, V2_NUM_OUTPUT_POLICY>(policy_data, v2_ip_pol_w, v2_ip_pol_b, output_pol);
+    }
+    innerproduct<NUM_VALUE_INPUT_PLANES*width*height, NUM_VALUE_CHANNELS>(value_data, ip1_val_w, ip1_val_b, output_val);
 }
 
 template<typename T>
@@ -755,83 +946,131 @@ T relative_difference(T a, T b) {
     if (std::isnan(a) || std::isnan(b)) {
         return std::numeric_limits<T>::max();
     }
-    // Handle sign difference
-    if (((a < 0) != (b < 0)) && (a != 0) && (b != 0)) {
-        return std::numeric_limits<T>::max();
-    }
-    a = std::fabs(a);
-    b = std::fabs(b);
 
-    // Handle underflow
-    constexpr float small_number = 1e-3;
-    a = std::max(a, small_number);
-    b = std::max(b, small_number);
+    constexpr auto small_number = 1e-3f;
+    auto fa = std::fabs(a);
+    auto fb = std::fabs(b);
 
-    return std::max(fabs((a - b) / a), fabs((a - b) / b));
-}
-
-void compare_net_outputs(std::vector<float>& data,
-                         std::vector<float>& ref) {
-    // We accept an error up to 5%, but output values
-    // smaller than 1/1000th are "rounded up" for the comparison.
-    constexpr float relative_error = 5e-2;
-    int bad_outputs = 0;
-    for (auto idx = size_t{0}; idx < data.size(); ++idx) {
-        auto err = relative_difference(data[idx], ref[idx]);
-        if (err > relative_error) {
-            ++bad_outputs;
-            printf("Error in OpenCL calculation at %zu: expected %f got %f "
-                   "(error=%f%%)\n", idx, ref[idx], data[idx], err * 100.0);
-            printf("Update your GPU drivers or reduce the amount of games "
-                   "played simultaneously.\n");
+    if (fa > small_number && fb > small_number) {
+        // Handle sign difference
+        if (((a < 0) != (b < 0)) && (a != 0) && (b != 0)) {
+            return std::numeric_limits<T>::max();
         }
     }
-    if (bad_outputs > 3) {
-        throw std::runtime_error("OpenCL self-check mismatch.");
+
+    // Handle underflow
+    fa = std::max(fa, small_number);
+    fb = std::max(fb, small_number);
+
+    return std::max(fabs((fa - fb) / fa), fabs((fa - fb) / fb));
+}
+
+bool compare_net_outputs(std::vector<float>& data,
+                         std::vector<float>& ref,
+                         bool& fatal,
+                         bool display_only = false,
+                         std::string info = "") {
+    auto almost_equal = true;
+    // The idea is to allow an OpenCL error > 10% every SELFCHECK_MIN_EXPANSIONS
+    // correct expansions. As the num_expansions increases between errors > 10%,
+    // we'll allow more errors to occur (max 3) before crashing. As if it
+    // builds up credit.
+    constexpr int64 min_correct_expansions = SELFCHECK_MIN_EXPANSIONS / SELFCHECK_PROBABILITY / 2;
+    static_assert(min_correct_expansions > 0, "Increase minimal nof expansions");
+    static std::atomic<int64> num_expansions{min_correct_expansions};
+    num_expansions = std::min(num_expansions + 1, 3 * min_correct_expansions);
+
+    // We accept an error up to 10%, but output values
+    // smaller than 1/1000th are "rounded up" for the comparison.
+    constexpr float relative_error = 10e-2f;
+    for (auto idx = size_t{0}; idx < data.size(); ++idx) {
+        auto err = relative_difference(data[idx], ref[idx]);
+        if (display_only) {
+            myprintf("compare_net_outputs %s idx %d data %f ref %f err=%f\n",
+                info.c_str(), idx, data[idx], ref[idx], err);
+        } else if (err > relative_error) {
+            almost_equal = false;
+            myprintf("Error in OpenCL calculation: expected %f got %f (%lli"
+                       "(error=%f%%)\n", ref[idx], data[idx], num_expansions.load(), err * 100.0);
+            if (num_expansions < min_correct_expansions) {
+                fatal = true;
+            }
+            else {
+                num_expansions -= min_correct_expansions;
+            }
+        }
     }
+    return almost_equal;
 }
 #endif
 
-void Network::softmax(const std::vector<float>& input, std::vector<float>& output, float temperature) {
+void Network::softmax(const std::vector<float>& input,
+                      std::vector<float>& output,
+                      float temperature) {
     assert(&input != &output);
 
-    float alpha = *std::max_element(input.begin(), input.begin() + output.size());
+    auto alpha = *std::max_element(begin(input),
+                                   begin(input) + output.size());
     alpha /= temperature;
 
-    float denom = 0.0f;
-    std::vector<float> helper(output.size());
-    for (size_t i = 0; i < output.size(); i++) {
-        float val = std::exp((input[i]/temperature) - alpha);
-        helper[i] = val;
-        denom += val;
+    auto denom = 0.0f;
+    auto helper = std::vector<float>(output.size());
+    for (auto i = size_t{0}; i < output.size(); i++) {
+        auto val   = std::exp((input[i]/temperature) - alpha);
+        helper[i]  = val;
+        denom     += val;
     }
-    for (size_t i = 0; i < output.size(); i++) {
+    for (auto i = size_t{0}; i < output.size(); i++) {
         output[i] = helper[i] / denom;
     }
 }
 
-Network::Netresult Network::get_scored_moves(const BoardHistory& pos, DebugRawData* debug_data) {
+Network::Netresult Network::get_scored_moves(const BoardHistory& pos, DebugRawData* debug_data, bool skip_cache) {
+    Netresult result;
+    auto full_key = pos.cur().full_key();
+    // Mix in the history to try and ensure no false positive lookups where
+    // the cached values would differ from the NN evals.
+    int history_count = pos.positions.size();
+    for (int i = history_count - 2; i >= std::max(0, history_count - T_HISTORY); i--) {
+        full_key *= 31;
+        full_key ^= pos.positions[i].full_key();
+    }
+
+    // See if we already have this in the cache.
+    if (!skip_cache) {
+        if (NNCache::get_NNCache().lookup(full_key, result)) {
+            return result;
+        }
+    }
+
     NNPlanes planes;
     gather_features(pos, planes);
-    return get_scored_moves_internal(pos, planes, debug_data);
+    result = get_scored_moves_internal(pos, planes, debug_data);
+
+    // Insert result into cache.
+    NNCache::get_NNCache().insert(full_key, result);
+
+    return result;
 }
 
 Network::Netresult Network::get_scored_moves_internal(const BoardHistory& pos, NNPlanes& planes, DebugRawData* debug_data) {
-    assert(INPUT_CHANNELS == planes.bit.size()+3);
+    // NNPlanes is sized to support either version, so this assert uses
+    // MAX_INPUT_CHANNELS. The rest of the code uses get_input_channels()
+    // to match the actual number of bits expected by each network.
+    assert(MAX_INPUT_CHANNELS == planes.bit.size()+3);
     constexpr int width = 8;
     constexpr int height = 8;
     const auto convolve_channels = conv_pol_w.size() / conv_pol_b.size();
     std::vector<net_t> input_data;
     std::vector<net_t> output_data(convolve_channels * width * height);
-    std::vector<float> policy_data(Network::NUM_POLICY_INPUT_PLANES * width * height);
     std::vector<float> value_data(Network::NUM_VALUE_INPUT_PLANES * width * height);
-    std::vector<float> policy_out(Network::NUM_OUTPUT_POLICY);
-    std::vector<float> softmax_data(Network::NUM_OUTPUT_POLICY);
+    std::vector<float> policy_data(get_num_output_policy());
+    std::vector<float> softmax_data(get_num_output_policy());
     std::vector<float> winrate_data(Network::NUM_VALUE_CHANNELS);
     std::vector<float> winrate_out(1);
     // Data layout is input_data[(c * height + h) * width + w]
-    input_data.reserve(INPUT_CHANNELS * width * height);
-    for (int c = 0; c < INPUT_CHANNELS - 3; ++c) {
+    input_data.reserve(get_input_channels() * width * height);
+    for (int c = 0; c < get_input_channels() - 3; ++c) {
         for (int i = 0; i < 64; ++i) {
             input_data.emplace_back(net_t(planes.bit[c][i]));
         }
@@ -842,49 +1081,66 @@ Network::Netresult Network::get_scored_moves_internal(const BoardHistory& pos, N
     for (int i = 0; i < 64; ++i) {
         input_data.emplace_back(net_t(planes.move_count));
     }
+    // TODO: I changed this to a plane of ones for V2.
+    // To help see the edge of the board
     for (int i = 0; i < 64; ++i) {
-        input_data.emplace_back(net_t(0.0));
+        input_data.emplace_back(net_t(m_format_version == 1 ? 0.0 : 1.0));
     }
-    assert(input_data.size() == INPUT_CHANNELS * width * height);
+    assert(input_data.size() == get_input_channels() * width * height);
 #ifdef USE_OPENCL
-    opencl_net.forward(input_data, output_data);
+    opencl.forward(input_data, policy_data, value_data);
 #elif defined(USE_BLAS) && !defined(USE_OPENCL)
-    forward_cpu(input_data, output_data);
+    forward_cpu(input_data, policy_data, value_data);
 #endif
 #ifdef USE_OPENCL_SELFCHECK
     // Both implementations are available, self-check the OpenCL driver by
     // running both with a probability of 1/2000.
-    if (Random::get_Rng()() % SELFCHECK_PROBABILITY == 0) {
-        auto cpu_output_data = std::vector<float>(output_data.size());
-        forward_cpu(input_data, cpu_output_data);
-        compare_net_outputs(output_data, cpu_output_data);
+    if (Random::GetRng().RandInt(SELFCHECK_PROBABILITY) == 0) {
+        auto cpu_policy_data = std::vector<float>(policy_data.size());
+        auto cpu_value_data = std::vector<float>(value_data.size());
+        auto fatal = false;
+        forward_cpu(input_data, cpu_policy_data, cpu_value_data);
+        auto almost_equal = compare_net_outputs(policy_data, cpu_policy_data, fatal);
+        almost_equal &= compare_net_outputs(value_data, cpu_value_data, fatal);
+        if (!almost_equal) {
+            myprintf("PGN\n%s\nEND\n", pos.pgn().c_str());
+            // Compare again but with debug info
+            compare_net_outputs(policy_data, cpu_policy_data, fatal, true, "orig policy");
+            compare_net_outputs(value_data, cpu_value_data, fatal, true, "orig value");
+            // Call opencl.forward again to see if the error is reproduceable.
+            std::vector<float> value_data_retry(Network::NUM_VALUE_INPUT_PLANES * width * height);
+            std::vector<float> policy_data_retry(get_num_output_policy());
+            opencl.forward(input_data, policy_data_retry, value_data_retry);
+            auto almost_equal_retry = compare_net_outputs(policy_data_retry, policy_data, fatal, true, "retry policy");
+            almost_equal_retry &= compare_net_outputs(value_data_retry, value_data, fatal, true, "retry value");
+            if (!almost_equal_retry) {
+                throw std::runtime_error("OpenCL retry self-check mismatch.");
+            } else {
+                myprintf("compare_net_outputs retry was ok\n");
+            }
+            if (fatal) {
+                myprintf_so("Update your GPU drivers or reduce the amount of games "
+                           "played simultaneously.\n");
+                throw std::runtime_error("OpenCL self-check mismatch.");
+            }
+        }
     }
 #endif
-    // We calculate both network heads on the CPU. They are irregular
-    // and have a much lower compute densitity than the residual layers,
-    // which means they don't get much - if any - speedup from being on the
-    // GPU. See issue #185.
 
     // Get the moves
-    convolve<1>(Network::NUM_POLICY_INPUT_PLANES, output_data, conv_pol_w, conv_pol_b, policy_data);
-    batchnorm<width*height>(Network::NUM_POLICY_INPUT_PLANES, policy_data, bn_pol_w1.data(), bn_pol_w2.data());
-    innerproduct<Network::NUM_POLICY_INPUT_PLANES*width*height, Network::NUM_OUTPUT_POLICY>(policy_data, ip_pol_w, ip_pol_b, policy_out);
-    softmax(policy_out, softmax_data, cfg_softmax_temp);
+    softmax(policy_data, softmax_data, cfg_softmax_temp);
     std::vector<float>& outputs = softmax_data;
 
     // Now get the score
-    convolve<1>(Network::NUM_VALUE_INPUT_PLANES, output_data, conv_val_w, conv_val_b, value_data);
-    batchnorm<width*height>(Network::NUM_VALUE_INPUT_PLANES, value_data, bn_val_w1.data(), bn_val_w2.data());
-    innerproduct<Network::NUM_VALUE_INPUT_PLANES*width*height, NUM_VALUE_CHANNELS>(value_data, ip1_val_w, ip1_val_b, winrate_data);
-    innerproduct<NUM_VALUE_CHANNELS, 1>(winrate_data, ip2_val_w, ip2_val_b, winrate_out);
+    innerproduct<NUM_VALUE_CHANNELS, 1>(value_data, ip2_val_w, ip2_val_b, winrate_out);
 
     // Sigmoid
-    float winrate_sig = (1.0f + std::tanh(winrate_out[0])) / 2.0f;
+    auto winrate_sig = (1.0f + std::tanh(winrate_out[0])) / 2.0f;
 
     MoveList<LEGAL> moves(pos.cur());
     std::vector<scored_node> result;
     for (Move move : moves) {
-        result.emplace_back(outputs[lookup(move)], move);
+        result.emplace_back(outputs[lookup(move, pos.cur().side_to_move())], move);
     }
 
     if (debug_data) {
@@ -896,8 +1152,6 @@ Network::Netresult Network::get_scored_moves_internal(const BoardHistory& pos, N
 
     return std::make_pair(result, winrate_sig);
 }
-
-//void Network::show_heatmap(Position* state, Netresult& result, bool topmoves) { //--killed.
 
 template<PieceType Pt>
 void addPieces(const Position* pos, Color side, Network::NNPlanes& planes, int plane_idx, bool flip) {
@@ -913,41 +1167,49 @@ void Network::gather_features(const BoardHistory& bh, NNPlanes& planes) {
     Color them = ~us;
     const Position* pos = &bh.cur();
 
-    int kFeatureBase = T_HISTORY * 14;
+    int kFeatureBase = T_HISTORY * get_hist_planes();
     if (pos->can_castle(BLACK_OOO)) planes.bit[kFeatureBase+(us==BLACK?0:2)+0].set();
     if (pos->can_castle(BLACK_OO)) planes.bit[kFeatureBase+(us==BLACK?0:2)+1].set();
     if (pos->can_castle(WHITE_OOO)) planes.bit[kFeatureBase+(us==WHITE?0:2)+0].set();
     if (pos->can_castle(WHITE_OO)) planes.bit[kFeatureBase+(us==WHITE?0:2)+1].set();
     if (us == BLACK) planes.bit[kFeatureBase+4].set();
     planes.rule50_count = pos->rule50_count();
-    planes.move_count = pos->game_ply();
+    // Move count is redundant in chess and was clamped to uint8_t. We disabled
+    // in training and so we should disable the move_count plane as input to
+    // the NN here.
+    planes.move_count = 0;
 
     int mc = bh.positions.size() - 1;
+    bool flip = us == BLACK;
     for (int i = 0; i < std::min(T_HISTORY, mc + 1); ++i) {
         pos = &bh.positions[mc - i];
 
-        us = pos->side_to_move();
-        them = ~us;
+        if (m_format_version == 1) {
+            us = pos->side_to_move();
+            them = ~us;
 
-        bool flip = us == BLACK;
+            flip = us == BLACK;
+        }
 
-        addPieces<PAWN  >(pos, us, planes, i * 14 + 0, flip);
-        addPieces<KNIGHT>(pos, us, planes, i * 14 + 1, flip);
-        addPieces<BISHOP>(pos, us, planes, i * 14 + 2, flip);
-        addPieces<ROOK  >(pos, us, planes, i * 14 + 3, flip);
-        addPieces<QUEEN >(pos, us, planes, i * 14 + 4, flip);
-        addPieces<KING  >(pos, us, planes, i * 14 + 5, flip);
+        addPieces<PAWN  >(pos, us, planes, i * get_hist_planes() + 0, flip);
+        addPieces<KNIGHT>(pos, us, planes, i * get_hist_planes() + 1, flip);
+        addPieces<BISHOP>(pos, us, planes, i * get_hist_planes() + 2, flip);
+        addPieces<ROOK  >(pos, us, planes, i * get_hist_planes() + 3, flip);
+        addPieces<QUEEN >(pos, us, planes, i * get_hist_planes() + 4, flip);
+        addPieces<KING  >(pos, us, planes, i * get_hist_planes() + 5, flip);
 
-        addPieces<PAWN  >(pos, them, planes, i * 14 + 6, flip);
-        addPieces<KNIGHT>(pos, them, planes, i * 14 + 7, flip);
-        addPieces<BISHOP>(pos, them, planes, i * 14 + 8, flip);
-        addPieces<ROOK  >(pos, them, planes, i * 14 + 9, flip);
-        addPieces<QUEEN >(pos, them, planes, i * 14 + 10, flip);
-        addPieces<KING  >(pos, them, planes, i * 14 + 11, flip);
+        addPieces<PAWN  >(pos, them, planes, i * get_hist_planes() + 6, flip);
+        addPieces<KNIGHT>(pos, them, planes, i * get_hist_planes() + 7, flip);
+        addPieces<BISHOP>(pos, them, planes, i * get_hist_planes() + 8, flip);
+        addPieces<ROOK  >(pos, them, planes, i * get_hist_planes() + 9, flip);
+        addPieces<QUEEN >(pos, them, planes, i * get_hist_planes() + 10, flip);
+        addPieces<KING  >(pos, them, planes, i * get_hist_planes() + 11, flip);
 
         int repetitions = pos->repetitions_count();
-        if (repetitions >= 1) planes.bit[i * 14 + 12].set();
-        if (repetitions >= 2) planes.bit[i * 14 + 13].set();
+        if (repetitions >= 1) planes.bit[i * get_hist_planes() + 12].set();
+        if (m_format_version == 1) {
+            if (repetitions >= 2) planes.bit[i * get_hist_planes() + 13].set();
+        }
     }
 }
 

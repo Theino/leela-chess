@@ -17,6 +17,9 @@ sudo apt-get install -y nginx
 sudo systemctl status nginx
 
 cp nginx/default /etc/nginx/sites-available/default
+
+# Create cache directory
+mkdir -p /home/web/nginx/cache/
 ```
 
 Installing postgres:
@@ -31,6 +34,15 @@ Shall the new role be allowed to create more new roles? (y/n) n
 $ sudo -u postgres createdb gorm
 $ sudo -u postgres psql
 ALTER ROLE gorm WITH PASSWORD 'gorm';
+\q
+
+$ sudo -u postgres psql -d gorm
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO web;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO web;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO web;
+
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+   GRANT SELECT ON TABLES TO web;
 \q
 ```
 
@@ -68,3 +80,45 @@ Connecting through psql:
 ```
 sudo -u postgres psql -d gorm
 ```
+
+Restarting nginx:
+```
+sudo service nginx restart
+```
+
+Postgres online repack
+```
+sudo apt-get install postgresql-server-dev-9.5 mawk
+sudo easy_install pgxnclient
+sudo pgxn install pg_repack
+sudo -u postgres psql -c "CREATE EXTENSION pg_repack" -d gorm
+/usr/lib/postgresql/9.5/bin/pg_repack
+```
+
+Postgres performance tuning
+```
+https://github.com/jfcoz/postgresqltuner
+```
+
+### Setting up backup
+
+```
+sudo pip install awscli
+
+# Set up IAM user with permissions to upload to s3
+aws configure
+```
+
+Executing a backup:
+```
+pg_dump gorm | gzip > backup.gz
+```
+
+Restoring from a backup:
+```
+$ dropdb -U gorm gorm
+$ createdb -U gorm gorm
+$ gunzip -c backup.gz | psql gorm
+```
+
+Note that on my mac, all the postgres utilities are at `/Library/PostgreSQL/10/bin/`.

@@ -34,13 +34,18 @@
 using std::string;
 
 const char* Position::StartFEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+// Use conservative value for now.
+// Can tune performance/accuracy tradeoff later.
+static constexpr auto RULE50_SCALE = 1;
 
 namespace Zobrist {
 
   Key psq[PIECE_NB][SQUARE_NB];
   Key enpassant[FILE_NB];
   Key castling[CASTLING_RIGHT_NB];
-  Key side, noPawns;
+  Key side;
+  Key rule50[102/RULE50_SCALE];
+  Key repetitions[3];
 }
 
 namespace {
@@ -99,10 +104,10 @@ void Position::init() {
 
   for (Piece pc : Pieces)
       for (Square s = SQ_A1; s <= SQ_H8; ++s)
-          Zobrist::psq[pc][s] = rng.rand<Key>();
+          Zobrist::psq[pc][s] = rng.RandInt<Key>();
 
   for (File f = FILE_A; f <= FILE_H; ++f)
-      Zobrist::enpassant[f] = rng.rand<Key>();
+      Zobrist::enpassant[f] = rng.RandInt<Key>();
 
   for (int cr = NO_CASTLING; cr <= ANY_CASTLING; ++cr)
   {
@@ -111,12 +116,25 @@ void Position::init() {
       while (b)
       {
           Key k = Zobrist::castling[1ULL << pop_lsb(&b)];
-          Zobrist::castling[cr] ^= k ? k : rng.rand<Key>();
+          Zobrist::castling[cr] ^= k ? k : rng.RandInt<Key>();
       }
   }
 
-  Zobrist::side = rng.rand<Key>();
-  Zobrist::noPawns = rng.rand<Key>();
+  Zobrist::side = rng.RandInt<Key>();
+  for (int i = 0; i < 102/RULE50_SCALE; ++i) {
+      Zobrist::rule50[i] = rng.RandInt<Key>();
+  }
+  for (int i = 0; i <= 2; ++i) {
+      Zobrist::repetitions[i] = rng.RandInt<Key>();
+  }
+}
+
+Key Position::full_key() const {
+  auto rule50 = std::min(101 / RULE50_SCALE, st->rule50 / RULE50_SCALE);
+  auto reps = std::min(2, repetitions_count());
+  // NOTE: Network will call this and then repetitions_count
+  // on cache misses. Could be optimized.
+  return st->key ^ Zobrist::rule50[rule50] ^ Zobrist::repetitions[reps];
 }
 
 /// Position::set() initializes the position object with the given FEN string.
@@ -297,7 +315,7 @@ void Position::set_check_info(StateInfo* si) const {
 
 void Position::set_state(StateInfo* si) const {
 
-  si->key = 0;
+  si->key = si->materialKey = 0;
   si->checkersBB = attackers_to(square<KING>(sideToMove)) & pieces(~sideToMove);
 
   set_check_info(si);
@@ -316,6 +334,11 @@ void Position::set_state(StateInfo* si) const {
       si->key ^= Zobrist::side;
 
   si->key ^= Zobrist::castling[si->castlingRights];
+  for (Piece pc : Pieces)
+  {
+      for (int cnt = 0; cnt < pieceCount[pc]; ++cnt)
+          si->materialKey ^= Zobrist::psq[pc][cnt];
+  }
 }
 
 
@@ -676,6 +699,7 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
       // Update material hash key and prefetch access to materialTable
       k ^= Zobrist::psq[captured][capsq];
 //      prefetch(thisThread->materialTable[st->materialKey]);
+      st->materialKey ^= Zobrist::psq[captured][pieceCount[captured]];
 
       // Reset rule 50 counter
       st->rule50 = 0;
@@ -726,6 +750,8 @@ void Position::do_move(Move m, StateInfo& newSt, bool givesCheck) {
 
           // Update hash keys
           k ^= Zobrist::psq[pc][to] ^ Zobrist::psq[promotion][to];
+          st->materialKey ^= Zobrist::psq[promotion][pieceCount[promotion] - 1]
+              ^ Zobrist::psq[pc][pieceCount[pc]];
       }
 
       // prefetch access to pawnsTable
@@ -905,6 +931,9 @@ Key Position::key_after(Move m) const {
 
 bool Position::is_draw() const {  //--didn't understand this _ply_ parameter; deleting it.
 
+  if (is_draw_by_insufficient_material())
+    return true;
+
   if (st->rule50 > 99 && (!checkers() || MoveList<LEGAL>(*this).size()))
       return true;
 
@@ -925,6 +954,23 @@ bool Position::is_draw() const {  //--didn't understand this _ply_ parameter; de
 
   return false;
 }
+
+bool Position::is_draw_by_insufficient_material() const {
+  switch (count<ALL_PIECES>()) {
+  case 2:
+    // K v K
+    return true;
+  case 3:
+    // K+B v K or K+N v K
+    return pieces(BISHOP, KNIGHT) != 0;
+  default:
+    // Kings + any number of bishops on the same square color
+    return pieces() == pieces(KING, BISHOP) &&
+           ((pieces(BISHOP) & DarkSquares) == 0 ||
+            (pieces(BISHOP) & ~DarkSquares) == 0);
+  }
+}
+
 int Position::repetitions_count() const {
   int end = std::min(st->rule50, st->pliesFromNull);
   
@@ -944,6 +990,33 @@ int Position::repetitions_count() const {
 }
 
 
+// Position::has_repeated() tests whether there has been at least one repetition
+// of positions since the last capture or pawn move.
+
+bool Position::has_repeated() const {
+
+    StateInfo* stc = st;
+    while (true)
+    {
+        int i = 4, e = std::min(stc->rule50, stc->pliesFromNull);
+
+        if (e < i)
+            return false;
+
+        StateInfo* stp = st->previous->previous;
+
+        do {
+            stp = stp->previous->previous;
+
+            if (stp->key == stc->key)
+                return true;
+
+            i += 2;
+        } while (i <= e);
+
+        stc = stc->previous;
+    }
+}
 /// Position::flip() flips position with the white and black sides reversed. This
 /// is only useful for debugging e.g. for finding evaluation symmetry bugs.
 
@@ -1088,7 +1161,7 @@ std::string Position::move_to_san(Move m) const {
         result += file;
         result += rank;
       }
-    } else if (type_of(pc) == PAWN && board[to] != NO_PIECE) {
+    } else if (type_of(pc) == PAWN && (board[to] != NO_PIECE || type_of(m) == ENPASSANT)) {
       result += file;
     }
 
@@ -1377,6 +1450,13 @@ void BoardHistory::do_move(Move m) {
   states.emplace_back(new StateInfo);
   positions.push_back(positions.back());
   positions.back().do_move(m, *states.back());
+}
+
+bool BoardHistory::undo_move() {
+	if (positions.size() == 1) return false;
+	states.pop_back();
+	positions.pop_back();
+	return true;
 }
 
 std::string BoardHistory::pgn() const {

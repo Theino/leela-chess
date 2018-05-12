@@ -19,6 +19,7 @@
 #include "config.h"
 #include "Utils.h"
 
+#include <iostream>
 #include <mutex>
 #include <cstdarg>
 #include <cstdio>
@@ -94,6 +95,20 @@ void Utils::myprintf(const char *fmt, ...) {
     }
 }
 
+void Utils::myprintf_so(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+
+    if (cfg_logfile_handle) {
+        std::lock_guard<std::mutex> lock(IOmutex);
+        va_start(ap, fmt);
+        vfprintf(cfg_logfile_handle, fmt, ap);
+        va_end(ap);
+    }
+}
+
 static void gtp_fprintf(FILE* file, const std::string& prefix,
                         const char *fmt, va_list ap) {
     fprintf(file, "%s ", prefix.c_str());
@@ -141,5 +156,14 @@ size_t Utils::lcm(size_t a, size_t b) {
         return a;
     }
     size_t ret = a + (b - a % b);
+    return ret;
+}
+
+size_t Utils::ceilMultiple(size_t a, size_t b) {
+    if (a % b == 0) {
+        return a;
+    }
+
+    auto ret = a + (b - a % b);
     return ret;
 }

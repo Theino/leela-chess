@@ -18,17 +18,11 @@
 #ifndef CONFIG_INCLUDED
 #define CONFIG_INCLUDED
 
-/*  Timing code. Define one or none of:
- *
- *  GETTICKCOUNT, GETTIMEOFDAY
- */
 #ifdef _WIN32
-#define GETTICKCOUNT
 #undef HAVE_SELECT
 #define NOMINMAX
 #else
 #define HAVE_SELECT
-#define GETTIMEOFDAY
 #endif
 
 /* Features */
@@ -37,13 +31,15 @@
 #define USE_OPENBLAS
 #endif
 //#define USE_MKL
+#ifndef FEATURE_USE_CPU_ONLY
 #define USE_OPENCL
 #define USE_OPENCL_SELFCHECK
-#define SELFCHECK_PROBABILITY 2000
-//#define USE_TUNER
+#endif
+static constexpr int SELFCHECK_PROBABILITY = 2000;
+static constexpr int SELFCHECK_MIN_EXPANSIONS = 2'000'000;
+#define USE_TUNER
 
-#define PROGRAM_NAME "Leela Zero"
-#define PROGRAM_VERSION "0.9"
+#define PROGRAM_VERSION "v0.10"
 
 // OpenBLAS limitation
 #if defined(USE_BLAS) && defined(USE_OPENBLAS)
@@ -64,11 +60,20 @@ typedef unsigned char uint8;
 /* Data type definitions */
 
 #ifdef _WIN32
-typedef __int64 int64 ;
+typedef __int64 int64;
 typedef unsigned __int64 uint64;
-#else
-typedef long long int int64 ;
+#define htole64(x) (x)
+#define htole32(x) (x)
+#elif defined(__APPLE__)
+typedef long long int int64;
 typedef  unsigned long long int uint64;
+#include <libkern/OSByteOrder.h>
+#define htole32(x) OSSwapHostToLittleInt32(x)
+#define htole64(x) OSSwapHostToLittleInt64(x)
+#else
+typedef long long int int64;
+typedef  unsigned long long int uint64;
+#include <endian.h>
 #endif
 
 using net_t = float;
@@ -76,17 +81,5 @@ using net_t = float;
 #if (_MSC_VER >= 1400) /* VC8+ Disable all deprecation warnings */
     #pragma warning(disable : 4996)
 #endif /* VC8+ */
-
-#ifdef GETTICKCOUNT
-    typedef int rtime_t;
-#else
-    #if defined(GETTIMEOFDAY)
-        #include <sys/time.h>
-        #include <time.h>
-        typedef struct timeval rtime_t;
-    #else
-        typedef time_t rtime_t;
-    #endif
 #endif
 
-#endif

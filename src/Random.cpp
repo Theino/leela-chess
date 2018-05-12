@@ -16,46 +16,38 @@
     along with Leela Zero.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <time.h>
-#include <limits.h>
 #include <thread>
-#include "config.h"
 
-#include "Random.h"
-#include "Utils.h"
 #include "Parameters.h"
+#include "Utils.h"
+#include "Random.h"
 
-Random& Random::get_Rng(void) {
-    static thread_local Random s_rng{0};
-    return s_rng;
+Random::Random(std::uint64_t seed) {
+  if (seed == 0) {
+    // C++11 doesn't guarantee *anything* about how random this is,
+    // and in MinGW it isn't random at all. But we can mix it in, which
+    // helps when it *is* high quality (Linux, MSVC).
+    std::random_device rd;
+    std::ranlux48 gen(rd());
+    std::uint64_t seed1 = (gen() << 16) ^ gen();
+    // If the above fails, this is one of our best, portable, bets.
+    std::uint64_t seed2 = std::chrono::high_resolution_clock::
+    now().time_since_epoch().count();
+
+    std::size_t thread_id =
+        std::hash<std::thread::id>()(std::this_thread::get_id());
+    seed = seed1 ^ seed2 ^ (std::uint64_t)thread_id;
+    Utils::myprintf("RNG seed: 0x%lx (thread: %lu)\n", seed, thread_id);
+  }
+  rand_engine_.seed(seed);
 }
 
-Random::Random(uint64 seed) {
-    if (seed == 0) {  //--is this necessary? consider reverting to Stockfish-style initialize seed directly, i.e. get rid of this branch.
-        size_t thread_id = std::hash<std::thread::id>()(std::this_thread::get_id());
-        s = cfg_rng_seed ^ (uint64_t)thread_id;
-    } else {
-        s = seed;
-    }
+Random& Random::GetRng(void) {
+  // the rng is initialized on first GetRng call which is after the cli parsing.
+  static thread_local Random rng{cfg_rng_seed};
+  return rng;
 }
 
-uint16 Random::randuint16(const uint16 max) {
-    return ((rand64() >> 48) * max) >> 16;
+std::uint64_t Random::operator()() {
+  return RandInt<std::uint64_t>();
 }
-
-uint32 Random::randuint32(const uint32 max) {
-    return ((rand64() >> 32) * (uint64)max) >> 32;
-}
-
-uint32 Random::randuint32() {
-    return rand64() >> 32;
-}
-
-float Random::randflt(void) {
-    // We need a 23 bit mantissa + implicit 1 bit = 24 bit number
-    // starting from a 64 bit random.
-    constexpr float umax = 1.0f / (UINT32_C(1) << 24);
-    uint32 num = rand64() >> 40;
-    return ((float)num) * umax;
-}
-

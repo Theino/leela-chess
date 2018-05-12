@@ -26,11 +26,14 @@
 #include <string>
 
 #include "ThreadPool.h"
+#include "Misc.h"
+#include "Types.h"
 
 extern Utils::ThreadPool thread_pool;
 
 namespace Utils {
     void myprintf(const char *fmt, ...);
+    void myprintf_so(const char *fmt, ...);
     void gtp_printf(int id, const char *fmt, ...);
     void gtp_fail_printf(int id, const char *fmt, ...);
     void log_input(const std::string& input);
@@ -52,6 +55,8 @@ namespace Utils {
     }
 
     size_t lcm(size_t a, size_t b);
+    size_t ceilMultiple(size_t a, size_t b);
+
 }
 
 #endif

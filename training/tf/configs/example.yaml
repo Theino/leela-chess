@@ -4,20 +4,24 @@ name: 'kb1-64x6'                       # ideally no spaces
 gpu: 0                                 # gpu id to process on
 
 dataset: 
-  num_samples: 100000                  # nof samples to obtain
-  train_ratio: 0.75                    # trainingset ratio
-  skip: 16                             # skip every n +/- 1 pos
+  num_chunks: 100000                   # newest nof chunks to parse
+  train_ratio: 0.90                    # trainingset ratio
   input: '/path/to/chunks/*/draw/'     # supports glob
-  path: '/path/to/dataset'             # output dir
 
 training:
-  batch_size: 1024
-  learning_rate: 0.1
-  decay_rate: 0.1
-  decay_step: 100000
-  policy_loss_weight: 1.0
-  value_loss_weight: 0.01
-  path: '/tmp/testnet'
+    batch_size: 2048                   # training batch
+    total_steps: 140000                # terminate after these steps
+    shuffle_size: 524288               # size of the shuffle buffer
+    lr_values:                         # list of learning rates
+        - 0.02
+        - 0.002
+        - 0.0005
+    lr_boundaries:                     # list of boundaries
+        - 100000
+        - 130000
+    policy_loss_weight: 1.0            # weight of policy loss
+    value_loss_weight: 1.0             # weight of value loss
+    path: '/path/to/store/networks'    # network storage dir
 
 model:
   filters: 64
